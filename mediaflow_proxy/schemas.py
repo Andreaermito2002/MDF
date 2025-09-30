@@ -71,6 +71,10 @@ class HLSManifestParams(GenericParams):
         None,
         description="Force all playlist URLs to be proxied through MediaFlow regardless of m3u8_content_routing setting. Useful for IPTV m3u/m3u_plus formats that don't have clear URL indicators.",
     )
+    key_only_proxy: Optional[bool] = Field(
+        False,
+        description="Only proxy the key URL, leaving segment URLs direct.",
+    )
 
 
 class MPDManifestParams(GenericParams):
@@ -96,7 +100,7 @@ class MPDSegmentParams(GenericParams):
 
 class ExtractorURLParams(GenericParams):
     host: Literal[
-        "Doodstream", "FileLions", "FileMoon", "Mixdrop", "Uqload", "Streamtape", "Supervideo", "VixCloud", "Okru", "Maxstream", "LiveTV", "LuluStream", "DLHD", "Fastream"
+        "Doodstream", "FileLions", "FileMoon", "Mixdrop", "Uqload", "Streamtape", "Supervideo", "VixCloud", "Okru", "Maxstream", "LiveTV", "LuluStream", "DLHD", "Fastream", "Voe"
     ] = Field(..., description="The host to extract the URL from.")
     destination: str = Field(..., description="The URL of the stream.", alias="d")
     redirect_stream: bool = Field(False, description="Whether to redirect to the stream endpoint automatically.")
