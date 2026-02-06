@@ -109,23 +109,43 @@ class Streamer:
         self.start_byte = 0
         self.end_byte = 0
         self.total_size = 0
+        # Store request details for potential retry during streaming
+        self._current_url: typing.Optional[str] = None
+        self._current_headers: typing.Optional[dict] = None
 
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=4, max=10),
         retry=retry_if_exception_type(DownloadError),
     )
-    async def create_streaming_response(self, url: str, headers: dict):
+    async def create_streaming_response(self, url: str, headers: dict, method: str = "GET"):
         """
         Creates and sends a streaming request.
 
         Args:
             url: The URL to stream from.
             headers: The headers to include in the request.
+            method: HTTP method to use (GET or HEAD). Defaults to GET.
+                    For HEAD requests, will fallback to GET if server doesn't support HEAD.
         """
+        # Store request details for potential retry during streaming
+        self._current_url = url
+        self._current_headers = headers.copy()
+
         try:
-            self.response = await self.session.get(url, headers=headers, proxy=self.proxy_url)
-            self.response.raise_for_status()
+            if method.upper() == "HEAD":
+                # Try HEAD first, fallback to GET if server doesn't support it
+                try:
+                    self.response = await self.session.head(url, headers=headers, proxy=self.proxy_url)
+                    self.response.raise_for_status()
+                except (aiohttp.ClientResponseError, aiohttp.ClientError) as head_error:
+                    # HEAD failed, fallback to GET (some servers don't support HEAD)
+                    logger.debug(f"HEAD request failed ({head_error}), falling back to GET")
+                    self.response = await self.session.get(url, headers=headers, proxy=self.proxy_url)
+                    self.response.raise_for_status()
+            else:
+                self.response = await self.session.get(url, headers=headers, proxy=self.proxy_url)
+                self.response.raise_for_status()
         except asyncio.TimeoutError:
             logger.warning("Timeout while creating streaming response")
             raise DownloadError(409, "Timeout while creating streaming response")
@@ -142,11 +162,52 @@ class Streamer:
             logger.error(f"Error creating streaming response: {e}")
             raise RuntimeError(f"Error creating streaming response: {e}")
 
+    async def _retry_connection(self, from_byte: int) -> bool:
+        """
+        Attempt to reconnect to the upstream using Range header.
+
+        Args:
+            from_byte: The byte position to resume from.
+
+        Returns:
+            bool: True if reconnection was successful, False otherwise.
+        """
+        if not self._current_url or not self._current_headers:
+            return False
+
+        # Close existing response if any
+        if self.response:
+            self.response.close()
+            self.response = None
+
+        # Create new headers with Range
+        retry_headers = self._current_headers.copy()
+        if self.total_size > 0:
+            retry_headers["Range"] = f"bytes={from_byte}-{self.total_size - 1}"
+        else:
+            retry_headers["Range"] = f"bytes={from_byte}-"
+
+        try:
+            self.response = await self.session.get(self._current_url, headers=retry_headers, proxy=self.proxy_url)
+            # Accept both 200 and 206 (Partial Content) as valid responses
+            if self.response.status in (200, 206):
+                logger.info(f"Successfully reconnected at byte {from_byte}")
+                return True
+            else:
+                logger.warning(f"Retry connection returned unexpected status: {self.response.status}")
+                return False
+        except Exception as e:
+            logger.warning(f"Failed to reconnect: {e}")
+            return False
+
     async def stream_content(
         self, transformer: typing.Optional[StreamTransformer] = None
     ) -> typing.AsyncGenerator[bytes, None]:
         """
         Stream content from the response, optionally applying a transformer.
+
+        Includes automatic retry logic when upstream disconnects mid-stream,
+        using Range headers to resume from the last successful byte.
 
         Args:
             transformer: Optional StreamTransformer to apply host-specific
@@ -159,74 +220,83 @@ class Streamer:
         if not self.response:
             raise RuntimeError("No response available for streaming")
 
-        try:
-            self.parse_content_range()
+        retry_count = 0
+        max_retries = settings.upstream_retry_attempts if settings.upstream_retry_on_disconnect else 0
 
-            # Create async generator from response content
-            async def raw_chunks():
-                async for chunk in self.response.content.iter_any():
-                    yield chunk
+        while True:
+            try:
+                self.parse_content_range()
 
-            # Choose the chunk source based on whether we have a transformer
-            if transformer:
-                chunk_source = transformer.transform(raw_chunks())
-            else:
-                chunk_source = raw_chunks()
+                # Create async generator from response content
+                async def raw_chunks():
+                    async for chunk in self.response.content.iter_any():
+                        yield chunk
 
-            if settings.enable_streaming_progress:
-                with tqdm_asyncio(
-                    total=self.total_size,
-                    initial=self.start_byte,
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                    desc="Streaming",
-                    ncols=100,
-                    mininterval=1,
-                ) as self.progress_bar:
+                # Choose the chunk source based on whether we have a transformer
+                # Note: Transformer state may not survive reconnection properly for all transformers
+                if transformer and retry_count == 0:
+                    chunk_source = transformer.transform(raw_chunks())
+                else:
+                    chunk_source = raw_chunks()
+
+                if settings.enable_streaming_progress:
+                    with tqdm_asyncio(
+                        total=self.total_size,
+                        initial=self.start_byte,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc="Streaming",
+                        ncols=100,
+                        mininterval=1,
+                    ) as self.progress_bar:
+                        async for chunk in chunk_source:
+                            yield chunk
+                            self.bytes_transferred += len(chunk)
+                            self.progress_bar.update(len(chunk))
+                else:
                     async for chunk in chunk_source:
                         yield chunk
                         self.bytes_transferred += len(chunk)
-                        self.progress_bar.update(len(chunk))
-            else:
-                async for chunk in chunk_source:
-                    yield chunk
-                    self.bytes_transferred += len(chunk)
 
-        except asyncio.TimeoutError:
-            logger.warning("Timeout while streaming")
-            raise DownloadError(409, "Timeout while streaming")
-        except aiohttp.ServerDisconnectedError as e:
-            # Special handling for connection closed errors
-            logger.warning(f"Remote server closed connection prematurely: {e}")
-            if self.bytes_transferred > 0:
-                logger.info(
-                    f"Partial content received ({self.bytes_transferred} bytes). Continuing with available data."
-                )
+                # Successfully completed streaming
                 return
-            else:
-                raise DownloadError(502, f"Remote server closed connection without sending any data: {e}")
-        except GeneratorExit:
-            logger.info("Streaming session stopped by the user")
-        except aiohttp.ClientPayloadError as e:
-            # Handle network read errors gracefully
-            logger.warning(f"ClientPayloadError while streaming: {e}")
-            if self.bytes_transferred > 0:
-                logger.info(
-                    f"Partial content received ({self.bytes_transferred} bytes) before error. Graceful termination."
-                )
+
+            except asyncio.TimeoutError:
+                logger.warning("Timeout while streaming")
+                raise DownloadError(409, "Timeout while streaming")
+            except (aiohttp.ServerDisconnectedError, aiohttp.ClientPayloadError, aiohttp.ClientError) as e:
+                # Handle connection errors with potential retry
+                error_type = type(e).__name__
+                logger.warning(f"{error_type} while streaming after {self.bytes_transferred} bytes: {e}")
+
+                # Check if we should retry
+                if retry_count < max_retries and self.bytes_transferred > 0:
+                    retry_count += 1
+                    resume_from = self.start_byte + self.bytes_transferred
+                    logger.info(f"Attempting reconnection (retry {retry_count}/{max_retries}) from byte {resume_from}")
+
+                    # Wait before retry
+                    await asyncio.sleep(settings.upstream_retry_delay)
+
+                    if await self._retry_connection(resume_from):
+                        # Successfully reconnected, continue the loop to resume streaming
+                        continue
+                    else:
+                        logger.warning(f"Reconnection failed on retry {retry_count}")
+
+                # No more retries or reconnection failed
+                if self.bytes_transferred > 0:
+                    logger.info(
+                        f"Partial content received ({self.bytes_transferred} bytes). "
+                        f"Graceful termination after {retry_count} retry attempts."
+                    )
+                    return
+                else:
+                    raise DownloadError(502, f"{error_type} while streaming: {e}")
+            except GeneratorExit:
+                logger.info("Streaming session stopped by the user")
                 return
-            else:
-                raise DownloadError(502, f"ClientPayloadError while streaming: {e}")
-        except aiohttp.ClientError as e:
-            logger.warning(f"ClientError while streaming: {e}")
-            if self.bytes_transferred > 0:
-                logger.info(
-                    f"Partial content received ({self.bytes_transferred} bytes) before error. Graceful termination."
-                )
-                return
-            else:
-                raise DownloadError(502, f"ClientError while streaming: {e}")
 
     @staticmethod
     def format_bytes(size) -> str:
@@ -346,7 +416,17 @@ async def create_streamer(url: str = None) -> Streamer:
     routing_config = get_routing_config()
     route_match = routing_config.match_url(url)
 
-    timeout_config = ClientTimeout(total=settings.transport_config.timeout)
+    # Use sock_read timeout: no total timeout, but timeout if no data received
+    # for sock_read seconds. This correctly handles:
+    # - Live streams (indefinite duration)
+    # - Large file downloads (total time depends on file size)
+    # - Seek operations (upstream may take time to seek)
+    # - Dead connection detection (timeout if no data flows)
+    timeout_config = ClientTimeout(
+        total=None,
+        sock_read=settings.transport_config.timeout,
+    )
+
     connector, proxy_url = _create_connector(route_match.proxy_url, route_match.verify_ssl)
 
     session = ClientSession(connector=connector, timeout=timeout_config)
@@ -735,16 +815,16 @@ class EnhancedStreamingResponse(Response):
             except (aiohttp.ServerDisconnectedError, aiohttp.ClientPayloadError, aiohttp.ClientError) as e:
                 # Handle connection closed / read errors gracefully
                 if data_sent:
-                    # We've sent some data to the client, so try to complete the response
-                    logger.warning(f"Upstream connection error after partial streaming: {e}")
-                    try:
-                        await send({"type": "http.response.body", "body": b"", "more_body": False})
-                        finalization_sent = True
-                        logger.info(
-                            f"Response finalized after partial content ({self.actual_content_length} bytes transferred)"
-                        )
-                    except Exception as close_err:
-                        logger.warning(f"Could not finalize response after upstream error: {close_err}")
+                    # We've sent some data to the client. With Content-Length set, we cannot
+                    # gracefully finalize a partial response - h11 will raise LocalProtocolError
+                    # if we try to send more_body: False without delivering all promised bytes.
+                    # The best we can do is log and return silently, letting the client handle
+                    # the incomplete response (most players will just stop or retry).
+                    logger.warning(
+                        f"Upstream connection error after partial streaming ({self.actual_content_length} bytes transferred): {e}"
+                    )
+                    # Don't try to finalize - just return and let the connection close naturally
+                    return
                 else:
                     # No data was sent, re-raise the error
                     logger.error(f"Upstream error before any data was streamed: {e}")
@@ -767,13 +847,16 @@ class EnhancedStreamingResponse(Response):
                 except Exception:
                     # If we can't send an error response, just log it
                     pass
-            elif response_started and not finalization_sent:
-                # Response already started but not finalized - gracefully close the stream
+            elif response_started and not finalization_sent and not data_sent:
+                # Response started but no data sent yet - we can safely finalize
+                # (If data was sent with Content-Length, we can't finalize without h11 error)
                 try:
                     await send({"type": "http.response.body", "body": b"", "more_body": False})
                     finalization_sent = True
                 except Exception:
                     pass
+            # If data was sent but streaming failed, just return silently
+            # The client will see an incomplete response which is unavoidable with Content-Length
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         async with anyio.create_task_group() as task_group:

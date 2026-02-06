@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import time
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
@@ -24,7 +25,7 @@ from .utils.http_utils import (
     create_streamer,
     apply_header_manipulation,
 )
-from .utils.m3u8_processor import M3U8Processor
+from .utils.m3u8_processor import M3U8Processor, generate_graceful_end_playlist
 from .utils.mpd_utils import pad_base64
 from .utils.stream_transformers import StreamTransformer, get_transformer
 from .configs import settings
@@ -32,35 +33,56 @@ from .configs import settings
 logger = logging.getLogger(__name__)
 
 
-def handle_exceptions(exception: Exception) -> Response:
+def handle_exceptions(exception: Exception, context: str = "") -> Response:
     """
     Handle exceptions and return appropriate HTTP responses.
 
+    Uses appropriate log levels based on exception type:
+    - DEBUG: Expected errors like 404 Not Found
+    - WARNING: Transient errors like timeouts, connection issues
+    - ERROR: Only for truly unexpected errors
+
     Args:
         exception (Exception): The exception that was raised.
+        context (str): Optional context string for better error messages.
 
     Returns:
         Response: An HTTP response corresponding to the exception type.
     """
+    ctx = f" [{context}]" if context else ""
+
     if isinstance(exception, aiohttp.ClientResponseError):
         if exception.status == 404:
-            logger.debug(f"Upstream 404: {exception.request_info.url if exception.request_info else 'unknown'}")
+            logger.debug(f"Upstream 404{ctx}: {exception.request_info.url if exception.request_info else 'unknown'}")
+            return Response(status_code=404, content="Upstream resource not found")
+        elif exception.status in (502, 503, 504):
+            # Upstream server errors - log at warning level as these are often transient
+            logger.warning(f"Upstream server error{ctx}: {exception.status}")
+            return Response(status_code=exception.status, content=f"Upstream server error: {exception.status}")
         else:
-            logger.error(f"Upstream service error while handling request: {exception}")
+            logger.warning(f"Upstream HTTP error{ctx}: {exception}")
         return Response(status_code=exception.status, content=f"Upstream service error: {exception}")
     elif isinstance(exception, DownloadError):
-        logger.error(f"Error downloading content: {exception}")
+        # DownloadError is expected for various upstream issues
+        logger.warning(f"Download error{ctx}: {exception}")
         return Response(status_code=exception.status_code, content=str(exception))
     elif isinstance(exception, tenacity.RetryError):
+        logger.warning(f"Max retries exceeded{ctx}")
         return Response(status_code=502, content="Max retries exceeded while downloading content")
     elif isinstance(exception, asyncio.TimeoutError):
-        logger.error(f"Timeout error: {exception}")
+        logger.warning(f"Timeout error{ctx}: upstream did not respond in time")
         return Response(status_code=504, content="Gateway timeout")
     elif isinstance(exception, aiohttp.ClientError):
-        logger.error(f"Client error: {exception}")
+        # Client errors are often network issues - warning level
+        logger.warning(f"Client error{ctx}: {exception}")
         return Response(status_code=502, content=f"Upstream connection error: {exception}")
+    elif isinstance(exception, ValueError) and "HTML instead of m3u8" in str(exception):
+        # Expected error when upstream returns error page instead of playlist
+        logger.warning(f"Upstream returned HTML{ctx}: stream may be offline or unavailable")
+        return Response(status_code=502, content=str(exception))
     else:
-        logger.exception(f"Internal server error while handling request: {exception}")
+        # Only use exception() (with traceback) for truly unexpected errors
+        logger.exception(f"Unexpected error{ctx}: {exception}")
         return Response(status_code=502, content=f"Internal server error: {exception}")
 
 
@@ -127,6 +149,7 @@ async def handle_hls_stream_proxy(
                 hls_params.no_proxy,
                 skip_segments_list,
                 transformer,
+                hls_params.start_offset,
             )
 
         parsed_url = urlparse(hls_params.destination)
@@ -145,6 +168,7 @@ async def handle_hls_stream_proxy(
                 hls_params.no_proxy,
                 skip_segments_list,
                 transformer,
+                hls_params.start_offset,
             )
 
         # Create initial streaming response to check content type
@@ -165,6 +189,7 @@ async def handle_hls_stream_proxy(
                 hls_params.no_proxy,
                 skip_segments_list,
                 transformer,
+                hls_params.start_offset,
             )
 
         # If we're removing content-range but upstream returned 206, change to 200
@@ -204,7 +229,7 @@ async def handle_stream_request(
     Returns:
         Union[Response, EnhancedStreamingResponse]: Either a HEAD response with headers or a streaming response.
     """
-    streamer = await create_streamer()
+    streamer = await create_streamer(video_url)
 
     try:
         # Auto-detect and resolve Vavoo links
@@ -222,12 +247,17 @@ async def handle_stream_request(
                 logger.warning(f"Failed to auto-resolve Vavoo URL: {e}")
                 # Continue with original URL if resolution fails
 
-        # Debug: log request headers being sent
-        logger.debug(f"Request headers being sent to upstream: {proxy_headers.request}")
-        await streamer.create_streaming_response(video_url, proxy_headers.request)
+        # Log timing for debugging seek performance
+        start_time = time.time()
+        range_header = proxy_headers.request.get("range", "not set")
+        logger.info(f"[handle_stream] Starting upstream {method} request - range: {range_header}")
 
-        # Debug: log upstream response headers
-        logger.debug(f"Upstream response status: {streamer.response.status}")
+        # Use the same HTTP method for upstream request (HEAD for HEAD, GET for GET)
+        # This prevents unnecessary data download when client just wants headers
+        await streamer.create_streaming_response(video_url, proxy_headers.request, method=method)
+
+        elapsed = time.time() - start_time
+        logger.info(f"[handle_stream] Upstream responded in {elapsed:.2f}s - status: {streamer.response.status}")
         logger.debug(f"Upstream response headers: {dict(streamer.response.headers)}")
 
         response_headers = prepare_response_headers(
@@ -296,7 +326,10 @@ def prepare_response_headers(
 
 
 async def proxy_stream(
-    method: str, destination: str, proxy_headers: ProxyRequestHeaders, transformer_id: Optional[str] = None
+    method: str,
+    destination: str,
+    proxy_headers: ProxyRequestHeaders,
+    transformer_id: Optional[str] = None,
 ):
     """
     Proxies the stream request to the given video URL.
@@ -324,6 +357,7 @@ async def fetch_and_process_m3u8(
     no_proxy: bool = False,
     skip_segments: list = None,
     transformer: Optional[StreamTransformer] = None,
+    start_offset: float = None,
 ):
     """
     Fetches and processes the m3u8 playlist on-the-fly, converting it to an HLS playlist.
@@ -340,6 +374,8 @@ async def fetch_and_process_m3u8(
         skip_segments (list, optional): List of time segments to skip. Each item should have
                                         'start', 'end' (in seconds), and optionally 'type'.
         transformer (StreamTransformer, optional): Transformer to apply to the stream content.
+        start_offset (float, optional): Time offset in seconds for EXT-X-START tag. Use negative
+                                       values for live streams to start behind the live edge.
 
     Returns:
         Response: The HTTP response with the processed m3u8 playlist.
@@ -351,7 +387,9 @@ async def fetch_and_process_m3u8(
 
         # Initialize processor and response headers
         # skip_segments is already a list of dicts with 'start' and 'end' keys
-        processor = M3U8Processor(request, key_url, force_playlist_proxy, key_only_proxy, no_proxy, skip_segments)
+        processor = M3U8Processor(
+            request, key_url, force_playlist_proxy, key_only_proxy, no_proxy, skip_segments, start_offset
+        )
         base_headers = {
             "content-disposition": "inline",
             "accept-ranges": "none",
@@ -371,12 +409,30 @@ async def fetch_and_process_m3u8(
         try:
             first_chunk = await m3u8_generator.__anext__()
         except ValueError as e:
-            # Upstream returned HTML instead of m3u8
+            # Upstream returned HTML instead of m3u8 - expected error, log at warning level
+            logger.warning(f"Upstream error for {url}: {e}")
             await streamer.close()
+            # Return graceful end playlist if enabled, otherwise raise error
+            if settings.graceful_stream_end:
+                graceful_content = generate_graceful_end_playlist("Stream offline or unavailable")
+                return Response(
+                    content=graceful_content,
+                    media_type="application/vnd.apple.mpegurl",
+                    headers=response_headers,
+                )
             raise HTTPException(status_code=502, detail=str(e))
         except StopAsyncIteration:
             # Empty response - this shouldn't happen for valid m3u8
+            logger.warning(f"Upstream returned empty m3u8 playlist: {url}")
             await streamer.close()
+            # Return graceful end playlist if enabled, otherwise raise error
+            if settings.graceful_stream_end:
+                graceful_content = generate_graceful_end_playlist("Empty upstream response")
+                return Response(
+                    content=graceful_content,
+                    media_type="application/vnd.apple.mpegurl",
+                    headers=response_headers,
+                )
             raise HTTPException(status_code=502, detail="Upstream returned empty m3u8 playlist")
 
         # Create a wrapper that yields the first chunk then continues with the rest
@@ -388,7 +444,7 @@ async def fetch_and_process_m3u8(
             except ValueError as e:
                 # This shouldn't happen since we already validated the first chunk,
                 # but handle it gracefully if it does
-                logger.error(f"Unexpected ValueError during m3u8 streaming: {e}")
+                logger.warning(f"ValueError during m3u8 streaming (after initial validation): {e}")
 
         # Create streaming response with on-the-fly processing
         return EnhancedStreamingResponse(
@@ -509,7 +565,9 @@ async def get_playlist(
     # Get skip segments if provided
     skip_segments = playlist_params.get_skip_segments()
 
-    return await process_playlist(request, mpd_dict, playlist_params.profile_id, proxy_headers, skip_segments)
+    return await process_playlist(
+        request, mpd_dict, playlist_params.profile_id, proxy_headers, skip_segments, playlist_params.start_offset
+    )
 
 
 async def get_segment(
@@ -554,7 +612,9 @@ async def get_segment(
                     )
 
         if not segment_content:
-            raise HTTPException(status_code=502, detail="Failed to download segment")
+            # Return 404 instead of 502 so players can skip and continue
+            # Most video players handle 404s gracefully by skipping the segment
+            raise HTTPException(status_code=404, detail="Segment unavailable")
 
         # Fetch init segment (uses its own cache)
         init_content = await get_cached_init_segment(

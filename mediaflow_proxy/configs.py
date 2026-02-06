@@ -47,7 +47,10 @@ class Settings(BaseSettings):
     m3u8_content_routing: Literal["mediaflow", "stremio", "direct"] = (
         "mediaflow"  # Routing strategy for M3U8 content URLs: "mediaflow", "stremio", or "direct"
     )
-    enable_hls_prebuffer: bool = False  # Whether to enable HLS pre-buffering for improved streaming performance.
+    enable_hls_prebuffer: bool = True  # Whether to enable HLS pre-buffering for improved streaming performance.
+    livestream_start_offset: (
+        float | None
+    ) = -18  # Default start offset for live streams (e.g., -18 to start 18 seconds behind live edge). Applies to HLS and MPD live playlists. Set to None to disable.
     hls_prebuffer_segments: int = 5  # Number of segments to pre-buffer ahead.
     hls_prebuffer_cache_size: int = 50  # Maximum number of segments to cache in memory.
     hls_prebuffer_max_memory_percent: int = 80  # Maximum percentage of system memory to use for HLS pre-buffer cache.
@@ -64,7 +67,26 @@ class Settings(BaseSettings):
     mpd_live_init_cache_ttl: int = 60  # TTL (seconds) for live init segment cache; 0 disables caching.
     mpd_live_playlist_depth: int = 8  # Number of recent segments to expose per live playlist variant.
 
+    # FlareSolverr settings (for Cloudflare bypass)
+    flaresolverr_url: str | None = None  # FlareSolverr service URL. Example: http://localhost:8191
+    flaresolverr_timeout: int = 60  # Timeout (seconds) for FlareSolverr requests.
+
+    # Acestream settings
+    enable_acestream: bool = False  # Whether to enable Acestream proxy support.
+    acestream_host: str = "localhost"  # Acestream engine host.
+    acestream_port: int = 6878  # Acestream engine port.
+    acestream_buffer_size: int = 4 * 1024 * 1024  # Buffer size for MPEG-TS streaming (4MB default, like acexy).
+    acestream_empty_timeout: int = 30  # Timeout (seconds) when no data is received from upstream.
+    acestream_session_timeout: int = 60  # Session timeout (seconds) for cleanup of inactive sessions.
+    acestream_keepalive_interval: int = 15  # Interval (seconds) for session keepalive polling.
+
     user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"  # The user agent to use for HTTP requests.
+
+    # Upstream error resilience settings
+    upstream_retry_on_disconnect: bool = True  # Enable/disable retry when upstream disconnects mid-stream.
+    upstream_retry_attempts: int = 2  # Number of retry attempts when upstream disconnects during streaming.
+    upstream_retry_delay: float = 1.0  # Delay (seconds) between retry attempts.
+    graceful_stream_end: bool = True  # Return valid empty playlist instead of error when upstream fails.
 
     class Config:
         env_file = ".env"

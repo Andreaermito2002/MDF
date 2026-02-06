@@ -324,6 +324,7 @@ async def _handle_hls_with_dlhd_retry(
             hls_params.key_only_proxy,
             hls_params.no_proxy,
             skip_segments_list,
+            hls_params.start_offset,
         )
         processed_manifest = await processor.process_m3u8(new_manifest, base_url=hls_params.destination)
 
@@ -477,6 +478,12 @@ async def proxy_stream_endpoint(
     Returns:
         Response: The HTTP response with the streamed content.
     """
+    # Log incoming request details for debugging seek issues
+    range_header = proxy_headers.request.get("range", "not set")
+    logger.info(
+        f"[proxy_stream] Request received - filename: {filename}, range: {range_header}, method: {request.method}"
+    )
+
     # Sanitize destination URL to fix common encoding issues
     destination = sanitize_url(destination)
 
